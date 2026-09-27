@@ -23,8 +23,11 @@ fills. attn.h adds it before the norm and the rotation (ATTN_QKV_BIAS).
 Args: pool (q k v o up gate down at their offsets), xres f32[HID] (in: the
 layer input; out: the layer output), consts [lnw | postln | qn kn], kv (the
 layer's KV cache, rows of [K_t | V_t]), act (scratch), ptab (position
-records). The KV window / new-row / record words are patched per token by the
-driver's attnpos (the stream is built for the placeholder position 1).
+records). The KV window / new-row / record offsets are, in the xclbin+insts.bin
+ABI, patched per token by the driver's attnpos (the stream is built for the
+placeholder position 1); on the full-ELF ABI (no host-visible instruction
+buffer to patch -- see npu-infer's runtime_layer.cpp) they are instead baked
+in at compile time via `pos`, one compiled program per position.
 Build (WSL): OPEN_KERNELS_SPEC=<qwen3 spec> python build_design.py designs/dense/dx.py designs/dense/build_h2560
 """
 
@@ -155,7 +158,7 @@ LN_FLAGS = [f"-DLN_N={HID}", f"-DLN_EPS={G.EPS:g}f"]
 
 @iron.jit(aiecc_flags=["--alloc-scheme=basic-sequential"])
 def dx(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, stop: CompileTime[int] = 99,
-       srchash: CompileTime[int] = 0):
+       srchash: CompileTime[int] = 0, pos: CompileTime[int] = 1):
     elem = np.ndarray[(CALL_BYTES,), np.dtype[np.uint8]]
     x_ty = np.ndarray[(ELEM // 2,), np.dtype[bfloat16]]
     y_ty = np.ndarray[(BAND_ROWS,), np.dtype[np.float32]]
@@ -542,13 +545,22 @@ def dx(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, st
             tg_x.finish()
             return
         # 3. attention: meta + record now, q / k / v after the GEMVs, the window, the new row out
+        # Full-ELF ABI (no host-visible instr buffer to patch, see runtime_layer.cpp):
+        # the window start/nf and the new-row/record offsets are baked in here from `pos`
+        # at compile time -- one compiled program per position -- instead of stream_patch's
+        # attnpos rewriting these same three quantities post-compile in the insts.bin ABI.
+        # Mirrors harness/stream_patch.hpp's attn_window() exactly.
+        _win = G.WINDOW
+        _start = (pos + 1 - _win) if (_win and pos + 1 > _win) else 0
+        _valid = pos - _start
+        _nf = _valid if _valid else 1
         pa_out, pa_in = Pipeline(3), Pipeline(3)
-        pa_out.drain(aout_c, a_kv, bt(L.KV_BYTES, L.KV_ROW, L.KV_ROW))          # [k' | v'] -> row pos (attnpos)
+        pa_out.drain(aout_c, a_kv, bt(L.KV_BYTES, pos * L.KV_ROW, L.KV_ROW))    # [k' | v'] -> row pos (attnpos)
 
         for c in range(ACORES):                                             # heads NHL*c ..
             pa_out.drain(og_cs[c], a_act, bt(L.AD_BYTES, L.AD_OG + c * NHL * G.HD * 2, NHL * G.HD * 2))
         pa_in.fill(ain_p, a_consts, bt(L.CD_BYTES, L.CD_META, E_A))            # [qn | kn]
-        pa_in.fill(ain_p, a_ptab, bt(L.PTAB_BYTES, L.PTAB_ROW, L.PTAB_ROW))    # the position record (attnpos)
+        pa_in.fill(ain_p, a_ptab, bt(L.PTAB_BYTES, pos * L.PTAB_ROW, L.PTAB_ROW))  # the position record (attnpos)
         py.finish(*y_conss)                                       # q, k, v are in DDR
         pa_in.fill(ain_p, a_act, bt(L.AD_BYTES, L.AD_Q, QW * 4))
         pa_in.fill(ain_p, a_act, bt(L.AD_BYTES, L.AD_KVN, KVW * 4))
@@ -557,7 +569,7 @@ def dx(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, st
             pa_in.fill(abias_p, a_consts, bt(L.CD_BYTES, L.CD_QB, QW * 2))
             pa_in.fill(abias_p, a_consts, bt(L.CD_BYTES, L.CD_KB, KVW * 2))
             pa_in.fill(abias_p, a_consts, bt(L.CD_BYTES, L.CD_VB, KVW * 2))
-        pa_in.fill(ain_p, a_kv, bt(L.KV_BYTES, 0, L.KV_ROW))                   # the window: rows [0, nf) (attnpos)
+        pa_in.fill(ain_p, a_kv, bt(L.KV_BYTES, _start * L.KV_ROW, _nf * L.KV_ROW))  # window: rows [start, start+nf) (attnpos)
         # 4. o projection against og
         for c in range(N_CORES):
             pw.fill(w_prods[c], a_pool, bt(L.POOL_BYTES, L.POOL_O + c * G.O_PC * BB_Q, G.O_PC * BB_Q))
