@@ -42,7 +42,7 @@ from dataclasses import dataclass
 
 from .catalogue import LIMITS, OpRangeError, check_buffer_args, require
 from .qwen36moe import (BAND_ROWS, CHUNK, ELEM, GEMM_T, MB, _op_index, band_bytes, proj_op, q4_chunks,
-                        mixed_check, quant_check, require_gemv, role_bytes, roundup, tab_bytes)
+                        mixed_check, quant_check, require_gemv, role_bytes, roundup, role_chunks, tab_bytes)
 from .spec import DENSE, DENSE_LOCAL, ModelSpec
 
 
@@ -323,6 +323,31 @@ def recipe(spec: ModelSpec, max_ctx: int = 4096) -> DenseRecipe:
     return DenseRecipe(spec=spec, layout=layout(spec, max_ctx), geo=geometry(spec), max_ctx=max_ctx)
 
 
+def pool_order(spec: ModelSpec) -> bool:
+    """Does this spec's design read the K-sub-band fan-out order?
+
+    A design with one GEMV row per column (8 columns here) reads a 64-row band of
+    the FULL K, which is what std_perm produces. The 16-GEMV-tile build fans one
+    stream per column out to four rows as 8-chunk units, which is a different
+    order for a projection wider than `hid`. Both derive their geometry from the
+    same `cores_for(spec)`, so keying the pool on it keeps the two in lockstep.
+    OVERRIDE: OPEN_KERNELS_SUBBAND_POOL=force / =off."""
+    o = os.environ.get("OPEN_KERNELS_SUBBAND_POOL", "")
+    if o not in ("", "0"):
+        return o.lower() != "off"
+    return cores_for(spec) > 8
+
+
+def fanout_op(spec: ModelSpec, role: str, tensor: str, dst: int, rows: int, cols: int,
+              in_dim: int, hid: int) -> dict:
+    """A K-spanning projection's pack op -- see `pool_order`."""
+    if pool_order(spec):
+        return {"op": "subband_perm", "tensor": tensor, "dst": dst,
+                "nch": role_chunks(spec, role, rows, cols), "in_dim": in_dim,
+                "hid": hid, "J": in_dim // hid}
+    return proj_op(spec, role, tensor, dst, rows, cols, in_dim)
+
+
 def pack_plan(spec: ModelSpec) -> dict:
     L, G = layout(spec), geometry(spec)
     hid, ff = spec.hidden, spec.intermediate
@@ -332,10 +357,10 @@ def pack_plan(spec: ModelSpec) -> dict:
                 proj_op(spec, "attn", pre + "self_attn.q_proj.weight", L.POOL_Q, G.QW, hid, hid),
                 proj_op(spec, "attn", pre + "self_attn.k_proj.weight", L.POOL_K, G.KVW, hid, hid),
                 proj_op(spec, "attn", pre + "self_attn.v_proj.weight", L.POOL_V, G.KVW, hid, hid),
-                proj_op(spec, "attn", pre + "self_attn.o_proj.weight", L.POOL_O, hid, G.QW, G.QW),
+                fanout_op(spec, "attn", pre + "self_attn.o_proj.weight", L.POOL_O, hid, G.QW, G.QW, hid),
                 proj_op(spec, "ffn", pre + "mlp.up_proj.weight", L.POOL_UP, ff, hid, hid),
                 proj_op(spec, "ffn", pre + "mlp.gate_proj.weight", L.POOL_GATE, ff, hid, hid),
-                proj_op(spec, "ffn", pre + "mlp.down_proj.weight", L.POOL_DOWN, hid, ff, ff),
+                fanout_op(spec, "ffn", pre + "mlp.down_proj.weight", L.POOL_DOWN, hid, ff, ff, hid),
             ],
             "consts": [
                 {"op": "put", "tensor": pre + "input_layernorm.weight", "dst": L.CD_LNW, "cap": L.ELN},

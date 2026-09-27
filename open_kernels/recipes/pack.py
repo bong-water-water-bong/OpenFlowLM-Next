@@ -386,6 +386,33 @@ def std_perm(nch: int, in_dim: int) -> np.ndarray:
     return rb * (in_dim // 256) + kt
 
 
+def subband_perm(nch: int, in_dim: int, hid: int, J: int) -> np.ndarray:
+    """pool chunk index -> file chunk index for the 16-tile K-sub-band fan-out.
+
+    OPEN-SUBBAND-POOL (engine#2668). The 16-tile design hands GEMV_ROWS rows a
+    contiguous 8-chunk unit each, and a projection wider than `hid` is walked as
+    `J` sub-bands of `hid` columns. `std_perm` lays a 64-row band's FULL K
+    contiguously, so past the first row those units do not fall on band
+    boundaries and rows 1..3 read the wrong band/K. This orders them
+    [column][sub-band][row-band] instead. Identical to std_perm when
+    in_dim <= hid (no sub-banding), which is why q/k/v/up/gate are untouched."""
+    ncol = in_dim // 256
+    nsub = in_dim // hid
+    k = np.arange(nch)
+    local = k % 8
+    u = k // 8
+    r = u % 4
+    jj = (u // 4) % J
+    c = u // (4 * J)
+    if nsub > 1:
+        band = c * 4 + r
+        kt = (hid // 256) * jj + local // 2
+    else:
+        band = u
+        kt = local // 2
+    return band * (2 * ncol) + (local % 2) * ncol + kt
+
+
 def down_perm(nch: int = 128) -> np.ndarray:
     """One expert's down [HID, FF] slice: pool chunk c <- file chunk 2*rt + cg,
     rt = 4*(c//8) + c%4, cg = (c//4)%2 (validated for [2048, 512])."""
@@ -540,6 +567,18 @@ def apply_op(op: dict, m, layer: int, dst: np.ndarray) -> None:
             raise ValueError(f"{op['tensor']}: too few chunks, need {c0 + op['nch']}")
         n = op["nch"] * CH
         dst[op["dst"]:op["dst"] + n] = sel[std_perm(op["nch"], op["in_dim"])].reshape(-1)
+    elif kind == "subband_perm":
+        # OPEN-SUBBAND-POOL: the 16-tile fan-out's order for a K-spanning role.
+        name = _name(op, "tensor", layer)
+        if not op.get("nch") or not op.get("in_dim") or not op.get("hid") or not op.get("J"):
+            raise ValueError(f"subband_perm {name} without nch / in_dim / hid / J")
+        c0 = op.get("chunk0", 0)
+        sel = q4_chunks_of(m, name, _raw(m, name), c0, op["nch"])
+        if sel.shape[0] != op["nch"]:
+            raise ValueError(f"{op['tensor']}: too few chunks, need {c0 + op['nch']}")
+        n = op["nch"] * CH
+        dst[op["dst"]:op["dst"] + n] = sel[subband_perm(op["nch"], op["in_dim"], op["hid"],
+                                                       op["J"])].reshape(-1)
     elif kind == "std_fuse":
         # OPEN-PACK-CHUNK-FUSE: a std_perm band whose source chunks are half-width. The
         # container holds 32 rows x 128 columns per chunk in the supertile raster
