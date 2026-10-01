@@ -15,6 +15,10 @@
 // --cross DIR (--rt only): for every token t with DIR/dx_pos{t}.elf, first run the
 // layers through that per-position ELF from the same input, then the --rt ELF, and require
 // byte-identical final residuals (both write the same row t and read only rows < t).
+// --at T: run position T only (input xres{T}.bin, or xres0.bin when there is none; the
+// reference is compared only where its file exists) -- with --kv-fill SEED, every layer's
+// cache starts as pseudo-random bf16 in [-1, 1) instead of zeros, so --at T --cross DIR
+// checks a long window (nf = T rows) against DIR/dx_pos{T}.elf with no fp64 run.
 // --kv-row B --ptab-row B --kv-bytes B --act-bytes B (default: Qwen3-0.6B's layout; --rt
 // takes kv_row / ptab_row / rows from <elf>.rtpos when it is there).
 // Build: g++ -std=c++20 -O2 -I/opt/xilinx/xrt/include dx_fullelf_check.cpp
@@ -61,7 +65,8 @@ int main(int argc, char** argv) {
   const std::string mode = argv[1], elf = argv[2], data = argv[3];
   const int ntok = std::stoi(argv[4]);
   const bool rt = mode == "--rt";
-  int layers = -1, passes = 2;
+  int layers = -1, passes = 2, at = -1;
+  long kv_fill = -1;
   size_t kv_row = 4096, ptab_row = 2048, kv_bytes = 16u << 20, act_bytes = 65536;
   std::string dump, cross;
   for (int i = 5; i + 1 < argc; i += 2) {
@@ -70,6 +75,8 @@ int main(int argc, char** argv) {
     else if (k == "--passes") passes = std::stoi(v);
     else if (k == "--dump") dump = v;
     else if (k == "--cross") cross = v;
+    else if (k == "--at") at = std::stoi(v);
+    else if (k == "--kv-fill") kv_fill = std::stol(v);
     else if (k == "--kv-row") kv_row = std::stoul(v);
     else if (k == "--ptab-row") ptab_row = std::stoul(v);
     else if (k == "--kv-bytes") kv_bytes = std::stoul(v);
@@ -93,7 +100,10 @@ int main(int argc, char** argv) {
   }
 
   const size_t max_ctx = kv_bytes / kv_row;
-  if ((size_t)ntok > max_ctx) { fprintf(stderr, "ntok %d > max_ctx %zu\n", ntok, max_ctx); return 2; }
+  if ((size_t)ntok > max_ctx || (at >= 0 && (size_t)at >= max_ctx)) {
+    fprintf(stderr, "position past max_ctx %zu\n", max_ctx);
+    return 2;
+  }
 
   xrt::device dev(0);
   auto bo_from = [&](size_t bytes, const std::vector<char>* init) {
@@ -122,6 +132,17 @@ int main(int argc, char** argv) {
     pool.push_back(bo_from(p.size(), &p));
     consts.push_back(bo_from(c.size(), &c));
     kv.push_back(bo_from(kv_bytes, nullptr));
+    if (kv_fill >= 0) {                              // xorshift64 -> bf16 in [-1, 1)
+      uint64_t x = 0x9E3779B97F4A7C15ull ^ (uint64_t)(kv_fill * 1000003 + l);
+      uint16_t* h = kv.back().map<uint16_t*>();
+      for (size_t i = 0; i < kv_bytes / 2; ++i) {
+        x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+        float f = (float)((x >> 40) & 0xFFFFFF) / 8388608.0f - 1.0f;
+        uint32_t b; std::memcpy(&b, &f, 4);
+        h[i] = (uint16_t)(b >> 16);
+      }
+      kv.back().sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    }
   }
   printf("%s %s: %d layers, %d tokens, hid %zu, max_ctx %zu\n", rt ? "rtpos" : "per-position", elf.c_str(),
          layers, ntok, hid, max_ctx);
@@ -162,12 +183,13 @@ int main(int argc, char** argv) {
   }
 
   std::vector<float> out(hid), ref(hid), first(hid);
-  std::vector<std::vector<float>> prev(ntok);
+  std::vector<std::vector<float>> prev(std::max(ntok, at + 1));
   int bad = 0, crossed = 0;
   for (int pass = 0; pass < passes; ++pass) {
     double worst = 1.0;
-    for (int t = 0; t < ntok; ++t) {
-      auto x = slurp(data + "/xres" + std::to_string(t) + ".bin");
+    for (int t = at >= 0 ? at : 0; t < (at >= 0 ? at + 1 : ntok); ++t) {
+      const std::string xin = data + "/xres" + std::to_string(t) + ".bin";
+      auto x = slurp(exists(xin) ? xin : data + "/xres0.bin");
       std::memcpy(xres.map<char*>(), x.data(), x.size());
       xres.sync(XCL_BO_SYNC_BO_TO_DEVICE);
       const uint32_t nf = t > 1 ? t : 1;
@@ -201,15 +223,27 @@ int main(int argc, char** argv) {
         if (l == 0 || l == layers - 1) {
           xres.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
           std::memcpy(out.data(), xres.map<char*>(), hid_bytes);
-          auto rf = slurp(data + "/ref_res" + std::to_string(l) + sfx(t) + ".bin");
-          std::memcpy(ref.data(), rf.data(), hid_bytes);
-          double c = cosine(out.data(), ref.data(), hid);
+          const std::string rfn = data + "/ref_res" + std::to_string(l) + sfx(t) + ".bin";
+          const bool has_ref = exists(rfn) && exists(xin) && kv_fill < 0;
+          double c = 1.0, c0 = 1.0;
+          if (has_ref) {
+            auto rf = slurp(rfn);
+            std::memcpy(ref.data(), rf.data(), hid_bytes);
+            c = cosine(out.data(), ref.data(), hid);
+          } else {
+            std::fill(ref.begin(), ref.end(), 0.0f);
+          }
           if (l == 0) first = out;
           if (l == layers - 1) {
-            double c0 = cosine(first.data(), (const float*)slurp(data + "/ref_res0" + sfx(t) + ".bin").data(), hid);
+            if (has_ref)
+              c0 = cosine(first.data(), (const float*)slurp(data + "/ref_res0" + sfx(t) + ".bin").data(), hid);
             bool same = pass == 0 || std::memcmp(prev[t].data(), out.data(), hid_bytes) == 0;
-            printf("pass %d pos %3d nf %3u  layer0 cos %.7f  layer%d cos %.7f  |res| %.2f vs %.2f%s\n", pass, t,
-                   nf, c0, l, c, maxabs(out.data(), hid), maxabs(ref.data(), hid), same ? "" : "  DIFFERS from pass 0");
+            if (has_ref)
+              printf("pass %d pos %3d nf %3u  layer0 cos %.7f  layer%d cos %.7f  |res| %.2f vs %.2f%s\n", pass, t,
+                     nf, c0, l, c, maxabs(out.data(), hid), maxabs(ref.data(), hid), same ? "" : "  DIFFERS from pass 0");
+            else
+              printf("pass %d pos %3d nf %3u  (no reference)  |res| %.2f%s\n", pass, t, nf, maxabs(out.data(), hid),
+                     same ? "" : "  DIFFERS from pass 0");
             if (!same) ++bad;
             if (!xout.empty()) {
               bool eq = std::memcmp(xout.data(), out.data(), hid_bytes) == 0;
