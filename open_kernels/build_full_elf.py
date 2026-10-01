@@ -27,7 +27,9 @@ address word. It always rewrites a register PAIR; on (length, address-low)
 it writes the address word back with its own low 16 bits (the sum cannot
 carry out of the length word), so only the length moves. Next to the ELF it
 writes <elf>.params.txt: "<n>" then "<name> <state_table_idx> <type> <kind>"
-per parameter (the format of mlir-aie's test_utils::ParameterScratchpad).
+per parameter (the format of mlir-aie's test_utils::ParameterScratchpad;
+all three are written raw, no << 2), and <elf>.rtpos: "kv_row B ptab_row B
+rows N" (the byte multipliers for the two offsets, and the cache's rows).
 """
 from __future__ import annotations
 import importlib.util
@@ -115,6 +117,10 @@ def build_rtpos(mod, design, out_elf: Path) -> None:
         rows = sorted((i, n, t, k) for n, (i, t, k) in params.items())
         (out_elf.parent / f"{out_elf.name}.params.txt").write_text(
             f"{len(rows)}\n" + "".join(f"{n} {i} {t} {k}\n" for i, n, t, k in rows))
+        L = mod.L                                        # the row geometry a host needs for the values
+        nrows = min(L.KV_BYTES // L.KV_ROW, L.PTAB_BYTES // L.PTAB_ROW)
+        (out_elf.parent / f"{out_elf.name}.rtpos").write_text(
+            f"kv_row {L.KV_ROW} ptab_row {L.PTAB_ROW} rows {nrows}\n")
         print(f"rtpos: window length += {mod.RTPOS_PARAMS[2]}[{idx}] * {mod.L.KV_ROW // 4} words; "
               f"params {rows}")
     except Exception:

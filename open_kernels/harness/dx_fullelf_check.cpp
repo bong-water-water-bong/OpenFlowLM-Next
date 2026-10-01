@@ -12,7 +12,11 @@
 // opts: --layers L (default: every pool_L*.bin), --passes P (default 2: the whole token
 // sequence is run P times; a later pass rewrites each KV row before any window reads it,
 // so every pass must produce the same bytes), --dump DIR (final residual per token),
-// --kv-row B --ptab-row B --kv-bytes B --act-bytes B (default: Qwen3-0.6B's layout).
+// --cross DIR (--rt only): for every token t with DIR/dx_pos{t}.elf, first run the
+// layers through that per-position ELF from the same input, then the --rt ELF, and require
+// byte-identical final residuals (both write the same row t and read only rows < t).
+// --kv-row B --ptab-row B --kv-bytes B --act-bytes B (default: Qwen3-0.6B's layout; --rt
+// takes kv_row / ptab_row / rows from <elf>.rtpos when it is there).
 // Build: g++ -std=c++20 -O2 -I/opt/xilinx/xrt/include dx_fullelf_check.cpp
 //        -L/opt/xilinx/xrt/lib -lxrt_coreutil -o dx_fullelf_check
 #include <cmath>
@@ -59,12 +63,13 @@ int main(int argc, char** argv) {
   const bool rt = mode == "--rt";
   int layers = -1, passes = 2;
   size_t kv_row = 4096, ptab_row = 2048, kv_bytes = 16u << 20, act_bytes = 65536;
-  std::string dump;
+  std::string dump, cross;
   for (int i = 5; i + 1 < argc; i += 2) {
     std::string k = argv[i], v = argv[i + 1];
     if (k == "--layers") layers = std::stoi(v);
     else if (k == "--passes") passes = std::stoi(v);
     else if (k == "--dump") dump = v;
+    else if (k == "--cross") cross = v;
     else if (k == "--kv-row") kv_row = std::stoul(v);
     else if (k == "--ptab-row") ptab_row = std::stoul(v);
     else if (k == "--kv-bytes") kv_bytes = std::stoul(v);
@@ -72,8 +77,6 @@ int main(int argc, char** argv) {
     else { fprintf(stderr, "unknown option %s\n", k.c_str()); return 2; }
   }
   if (layers < 0) for (layers = 0; exists(data + "/pools/pool_L" + std::to_string(layers) + ".bin"); ++layers) {}
-  const size_t max_ctx = kv_bytes / kv_row;
-  if ((size_t)ntok > max_ctx) { fprintf(stderr, "ntok %d > max_ctx %zu\n", ntok, max_ctx); return 2; }
 
   // Scratchpad indices (rt mode).
   std::map<std::string, int> pidx;
@@ -84,7 +87,13 @@ int main(int argc, char** argv) {
     for (int i = 0; i < n; ++i) { std::string name, ty, kind; int idx; pf >> name >> idx >> ty >> kind; pidx[name] = idx; }
     for (const char* need : {"dx_kv_row_off", "dx_ptab_off", "dx_win_extra"})
       if (!pidx.count(need)) { fprintf(stderr, "params.txt lacks %s\n", need); return 2; }
+    std::ifstream gf(elf + ".rtpos");                 // the row geometry the build recorded
+    std::string k1, k2, k3; size_t rows = 0;
+    if (gf >> k1 >> kv_row >> k2 >> ptab_row >> k3 >> rows) kv_bytes = rows * kv_row;
   }
+
+  const size_t max_ctx = kv_bytes / kv_row;
+  if ((size_t)ntok > max_ctx) { fprintf(stderr, "ntok %d > max_ctx %zu\n", ntok, max_ctx); return 2; }
 
   xrt::device dev(0);
   auto bo_from = [&](size_t bytes, const std::vector<char>* init) {
@@ -120,10 +129,10 @@ int main(int argc, char** argv) {
   // Contexts / kernels.
   std::map<int, std::unique_ptr<xrt::hw_context>> ctx;
   std::map<int, std::unique_ptr<xrt::ext::kernel>> krn;
-  auto kernel_for = [&](int t) -> xrt::ext::kernel& {
-    int key = rt ? 0 : t;
+  auto kernel_for = [&](int t, bool perpos) -> xrt::ext::kernel& {
+    int key = perpos ? t + 1 : 0;
     if (!krn.count(key)) {
-      std::string p = rt ? elf : elf + "/dx_pos" + std::to_string(t) + ".elf";
+      std::string p = !perpos ? elf : (rt ? cross : elf) + "/dx_pos" + std::to_string(t) + ".elf";
       auto fb = slurp(p);
       ctx[key] = std::make_unique<xrt::hw_context>(dev, xrt::elf(fb.data(), fb.size()));
       krn[key] = std::make_unique<xrt::ext::kernel>(*ctx[key], "main:sequence");
@@ -140,20 +149,21 @@ int main(int argc, char** argv) {
     r.set_arg(3, kv[l]); r.set_arg(4, act); r.set_arg(5, ptab);
   };
   if (rt) {
-    auto& k = kernel_for(0);
+    auto& k = kernel_for(0, false);
     for (int l = 0; l < layers; ++l) {
       runs.emplace_back(k);
       bind(runs.back(), l);
       sp_bo.push_back(runs.back().get_ctrl_scratchpad_bo());
       sp.push_back(sp_bo.back().map<uint32_t*>());
     }
-    printf("scratchpad: %zu bytes per run; idx row_off %d ptab_off %d win_extra %d\n", sp_bo[0].size(),
+    printf("scratchpad: %zu bytes per run (%s per run); idx row_off %d ptab_off %d win_extra %d\n",
+           sp_bo[0].size(), layers > 1 && sp_bo[0].address() != sp_bo[1].address() ? "separate" : "SHARED",
            pidx["dx_kv_row_off"], pidx["dx_ptab_off"], pidx["dx_win_extra"]);
   }
 
   std::vector<float> out(hid), ref(hid), first(hid);
   std::vector<std::vector<float>> prev(ntok);
-  int bad = 0;
+  int bad = 0, crossed = 0;
   for (int pass = 0; pass < passes; ++pass) {
     double worst = 1.0;
     for (int t = 0; t < ntok; ++t) {
@@ -161,6 +171,19 @@ int main(int argc, char** argv) {
       std::memcpy(xres.map<char*>(), x.data(), x.size());
       xres.sync(XCL_BO_SYNC_BO_TO_DEVICE);
       const uint32_t nf = t > 1 ? t : 1;
+      std::vector<float> xout;
+      if (rt && !cross.empty() && exists(cross + "/dx_pos" + std::to_string(t) + ".elf")) {
+        for (int l = 0; l < layers; ++l) {
+          xrt::run r(kernel_for(t, true));
+          bind(r, l);
+          r.start();
+          r.wait2();
+        }
+        xres.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        xout.assign((const float*)xres.map<char*>(), (const float*)xres.map<char*>() + hid);
+        std::memcpy(xres.map<char*>(), x.data(), x.size());
+        xres.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+      }
       for (int l = 0; l < layers; ++l) {
         if (rt) {
           sp[l][pidx["dx_kv_row_off"]] = (uint32_t)(t * kv_row);
@@ -170,7 +193,7 @@ int main(int argc, char** argv) {
           runs[l].start();
           runs[l].wait2();
         } else {
-          xrt::run r(kernel_for(t));
+          xrt::run r(kernel_for(t, true));
           bind(r, l);
           r.start();
           r.wait2();
@@ -188,6 +211,12 @@ int main(int argc, char** argv) {
             printf("pass %d pos %3d nf %3u  layer0 cos %.7f  layer%d cos %.7f  |res| %.2f vs %.2f%s\n", pass, t,
                    nf, c0, l, c, maxabs(out.data(), hid), maxabs(ref.data(), hid), same ? "" : "  DIFFERS from pass 0");
             if (!same) ++bad;
+            if (!xout.empty()) {
+              bool eq = std::memcmp(xout.data(), out.data(), hid_bytes) == 0;
+              printf("           pos %3d: dx_pos%d.elf output %s\n", t, t, eq ? "byte-identical" : "DIFFERS");
+              bad += !eq;
+              ++crossed;
+            }
             worst = std::min(worst, std::min(c, c0));
             prev[t] = out;
             if (!dump.empty()) {
@@ -200,6 +229,6 @@ int main(int argc, char** argv) {
     }
     printf("pass %d: worst cosine %.7f\n", pass, worst);
   }
-  printf("%s\n", bad ? "PASSES DIFFER" : "passes byte-identical");
+  printf("%s; %d per-position cross-checks\n", bad ? "MISMATCH" : "passes byte-identical", crossed);
   return bad ? 1 : 0;
 }
