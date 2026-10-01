@@ -180,7 +180,7 @@ def dx(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, st
         p_row = ScratchpadParameter(RTPOS_PARAMS[0], np.int32)
         p_rec = ScratchpadParameter(RTPOS_PARAMS[1], np.int32)
         p_win = ScratchpadParameter(RTPOS_PARAMS[2], np.int32)
-    elem =np.ndarray[(CALL_BYTES,), np.dtype[np.uint8]]
+    elem = np.ndarray[(CALL_BYTES,), np.dtype[np.uint8]]
     x_ty = np.ndarray[(ELEM // 2,), np.dtype[bfloat16]]
     y_ty = np.ndarray[(BAND_ROWS,), np.dtype[np.float32]]
     tab_ty = np.ndarray[(G.TAB_BYTES,), np.dtype[np.uint8]]
