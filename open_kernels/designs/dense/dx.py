@@ -26,8 +26,11 @@ layer's KV cache, rows of [K_t | V_t]), act (scratch), ptab (position
 records). The KV window / new-row / record offsets are, in the xclbin+insts.bin
 ABI, patched per token by the driver's attnpos (the stream is built for the
 placeholder position 1); on the full-ELF ABI (no host-visible instruction
-buffer to patch -- see npu-infer's runtime_layer.cpp) they are instead baked
-in at compile time via `pos`, one compiled program per position.
+buffer to patch -- see npu-infer's runtime_layer.cpp) they are either baked
+in at compile time via `pos` (one compiled program per position), or, with
+`rtpos=1`, set by the host per dispatch through the control-code scratchpad
+(RTPOS_PARAMS; one program for every position, built by
+`build_full_elf.py --rtpos`, which adds the window-length patch).
 Build (WSL): OPEN_KERNELS_SPEC=<qwen3 spec> python build_design.py designs/dense/dx.py designs/dense/build_h2560
 """
 
@@ -42,7 +45,8 @@ import numpy as np
 from ml_dtypes import bfloat16
 
 import aie.iron as iron
-from aie.iron import Buffer, CompileTime, In, InOut, ObjectFifo, Program, Runtime, TaskGroup, Worker
+from aie.iron import (Buffer, CompileTime, In, InOut, ObjectFifo, Program, Runtime, ScratchpadParameter,
+                      TaskGroup, Worker)
 from aie.iron.controlflow import range_
 from aie.iron.device import Tile
 from aie.iron.kernel import ExternalFunction
@@ -136,6 +140,16 @@ def bt(total, off, n):
     return TensorAccessPattern((1, total), off, [1, 1, 1, n], [0, 0, 0, 1])
 
 
+# rtpos=1: the scratchpad parameters the host writes before each dispatch, for position
+# p with nf = max(p, 1) (recipes/pack.py window_rows, window 0). All are raw 32-bit
+# words in the run's control scratchpad (xrt::run::get_ctrl_scratchpad_bo), at the
+# state-table index build_full_elf.py --rtpos records next to the ELF:
+#   dx_kv_row_off  = p * KV_ROW    bytes: where the new [K | V] row is written
+#   dx_ptab_off    = p * PTAB_ROW  bytes: which position record the attention core reads
+#   dx_win_extra   = nf - 1        rows streamed past the window's first one
+RTPOS_PARAMS = ("dx_kv_row_off", "dx_ptab_off", "dx_win_extra")
+
+
 ATTN_FLAGS = [f"-DATTN_NH={G.NH}", f"-DATTN_KVH={G.KVH}", f"-DATTN_HD={G.HD}", f"-DATTN_ROT={G.ROT}", "-DATTN_GATE=0",
               f"-DATTN_QKNORM={1 if G.QKNORM else 0}", f"-DATTN_QKNORM_POST={1 if G.QKNORM_POST else 0}",
               f"-DATTN_EPS={G.EPS:g}f", f"-DATTN_VEXP={G.VEXP}", f"-DATTN_NHL={G.NHL}"]
@@ -158,8 +172,15 @@ LN_FLAGS = [f"-DLN_N={HID}", f"-DLN_EPS={G.EPS:g}f"]
 
 @iron.jit(aiecc_flags=["--alloc-scheme=basic-sequential"])
 def dx(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, stop: CompileTime[int] = 99,
-       srchash: CompileTime[int] = 0, pos: CompileTime[int] = 1):
-    elem = np.ndarray[(CALL_BYTES,), np.dtype[np.uint8]]
+       srchash: CompileTime[int] = 0, pos: CompileTime[int] = 1, rtpos: CompileTime[int] = 0):
+    if rtpos:
+        # The window always starts at row 0 only without a sliding window; a windowed
+        # family would need a run-time start (offset_parameter) too -- not done yet.
+        assert not G.WINDOW, "dx.py rtpos: sliding-window attention needs a run-time window start"
+        p_row = ScratchpadParameter(RTPOS_PARAMS[0], np.int32)
+        p_rec = ScratchpadParameter(RTPOS_PARAMS[1], np.int32)
+        p_win = ScratchpadParameter(RTPOS_PARAMS[2], np.int32)
+    elem =np.ndarray[(CALL_BYTES,), np.dtype[np.uint8]]
     x_ty = np.ndarray[(ELEM // 2,), np.dtype[bfloat16]]
     y_ty = np.ndarray[(BAND_ROWS,), np.dtype[np.float32]]
     tab_ty = np.ndarray[(G.TAB_BYTES,), np.dtype[np.uint8]]
@@ -550,17 +571,29 @@ def dx(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, st
         # at compile time -- one compiled program per position -- instead of stream_patch's
         # attnpos rewriting these same three quantities post-compile in the insts.bin ABI.
         # Mirrors harness/stream_patch.hpp's attn_window() exactly.
+        #
+        # rtpos=1 makes all three run-time values instead (one program for every
+        # position; see RTPOS_PARAMS): the two offsets through offset_parameter, the
+        # window's row count through a BD-length patch build_full_elf.py --rtpos adds.
         _win = G.WINDOW
         _start = (pos + 1 - _win) if (_win and pos + 1 > _win) else 0
         _valid = pos - _start
         _nf = _valid if _valid else 1
+        if rtpos:
+            _row_tap, _row_kw = bt(L.KV_BYTES, 0, L.KV_ROW), {"offset_parameter": p_row}
+            _rec_tap, _rec_kw = bt(L.PTAB_BYTES, 0, L.PTAB_ROW), {"offset_parameter": p_rec}
+            _win_tap = bt(L.KV_BYTES, 0, L.KV_ROW)       # ONE row here; + (nf - 1) rows patched in
+        else:
+            _row_tap, _row_kw = bt(L.KV_BYTES, pos * L.KV_ROW, L.KV_ROW), {}
+            _rec_tap, _rec_kw = bt(L.PTAB_BYTES, pos * L.PTAB_ROW, L.PTAB_ROW), {}
+            _win_tap = bt(L.KV_BYTES, _start * L.KV_ROW, _nf * L.KV_ROW)
         pa_out, pa_in = Pipeline(3), Pipeline(3)
-        pa_out.drain(aout_c, a_kv, bt(L.KV_BYTES, pos * L.KV_ROW, L.KV_ROW))    # [k' | v'] -> row pos (attnpos)
+        pa_out.drain(aout_c, a_kv, _row_tap, **_row_kw)                      # [k' | v'] -> row pos (attnpos)
 
         for c in range(ACORES):                                             # heads NHL*c ..
             pa_out.drain(og_cs[c], a_act, bt(L.AD_BYTES, L.AD_OG + c * NHL * G.HD * 2, NHL * G.HD * 2))
         pa_in.fill(ain_p, a_consts, bt(L.CD_BYTES, L.CD_META, E_A))            # [qn | kn]
-        pa_in.fill(ain_p, a_ptab, bt(L.PTAB_BYTES, pos * L.PTAB_ROW, L.PTAB_ROW))  # the position record (attnpos)
+        pa_in.fill(ain_p, a_ptab, _rec_tap, **_rec_kw)                         # the position record (attnpos)
         py.finish(*y_conss)                                       # q, k, v are in DDR
         pa_in.fill(ain_p, a_act, bt(L.AD_BYTES, L.AD_Q, QW * 4))
         pa_in.fill(ain_p, a_act, bt(L.AD_BYTES, L.AD_KVN, KVW * 4))
@@ -569,7 +602,7 @@ def dx(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, st
             pa_in.fill(abias_p, a_consts, bt(L.CD_BYTES, L.CD_QB, QW * 2))
             pa_in.fill(abias_p, a_consts, bt(L.CD_BYTES, L.CD_KB, KVW * 2))
             pa_in.fill(abias_p, a_consts, bt(L.CD_BYTES, L.CD_VB, KVW * 2))
-        pa_in.fill(ain_p, a_kv, bt(L.KV_BYTES, _start * L.KV_ROW, _nf * L.KV_ROW))  # window: rows [start, start+nf) (attnpos)
+        pa_in.fill(ain_p, a_kv, _win_tap)                                     # window: rows [start, start+nf) (attnpos)
         # 4. o projection against og
         for c in range(N_CORES):
             pw.fill(w_prods[c], a_pool, bt(L.POOL_BYTES, L.POOL_O + c * G.O_PC * BB_Q, G.O_PC * BB_Q))
@@ -670,6 +703,11 @@ def dx(pool: In, xres: InOut, consts: In, kv: InOut, act: InOut, ptab: In, *, st
                             [of_y[c].cons(tile=Tile(c, 0)) for c in range(N_CORES)],
                             of_ain.prod(tile=Tile(2, 0))] + bprod + [of_aout.cons(tile=Tile(1, 0)),
                             [of_og[c].cons(tile=Tile(2 + c, 0)) for c in range(ACORES)]])
+    if rtpos:
+        # p_win is read by no core and no offset_parameter -- only by the BD-length patch
+        # build_full_elf.py --rtpos inserts after lowering -- so nothing registers it with
+        # the runtime; declare it here so the scratchpad pass gives it a state-table slot.
+        rt._scratchpad_parameters.append(p_win)
     return Program(iron.get_current_device(), rt, workers=workers).resolve_program()
 
 

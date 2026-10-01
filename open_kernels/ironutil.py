@@ -46,11 +46,16 @@ class Pipeline:
         fn(tg)
         q.append(tg)
 
-    def fill(self, prod, tensor, tap):
-        self._issue(prod, lambda tg: prod.fill(tensor, tap=tap, wait=True, group=tg))
+    # offset_parameter: a ScratchpadParameter whose host-written value (in buffer
+    # elements) is added to the tap's offset at run time; forwarded only when given,
+    # so a design that never passes one emits exactly the transfers it always did.
+    def fill(self, prod, tensor, tap, offset_parameter=None):
+        kw = {} if offset_parameter is None else {"offset_parameter": offset_parameter}
+        self._issue(prod, lambda tg: prod.fill(tensor, tap=tap, wait=True, group=tg, **kw))
 
-    def drain(self, cons, tensor, tap):
-        self._issue(cons, lambda tg: cons.drain(tensor, tap=tap, wait=True, group=tg))
+    def drain(self, cons, tensor, tap, offset_parameter=None):
+        kw = {} if offset_parameter is None else {"offset_parameter": offset_parameter}
+        self._issue(cons, lambda tg: cons.drain(tensor, tap=tap, wait=True, group=tg, **kw))
 
     def finish(self, *eps):
         """Await everything issued (or, with endpoints given, only their queues)."""
